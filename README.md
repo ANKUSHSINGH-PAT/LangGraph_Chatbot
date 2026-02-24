@@ -1,17 +1,11 @@
-Agentic Document QA Platform
+Agentic Document Intelligence System
 
-Developed an agentic workflow allowing users to upload documents and perform question-answering over file content.
+Designed and implemented an agent-based QA workflow supporting document upload and contextual user queries.
 
-Integrated MCP with tool calling for:
+Integrated MCP and external tools for web search, stock price retrieval, and dynamic knowledge augmentation.
 
-Web search
+Built persistent memory using SQL checkpoints and thread IDs, enabling session recovery and historical chat navigation.
 
-Company stock price retrieval
+Implemented conversation state management for maintaining recent user interactions.
 
-Database lookups
-
-Implemented SQL-based memory checkpointing using thread IDs to persist conversation state and enable users to revisit previous chats.
-
-Maintained recent chat history for contextual continuity across sessions.
-
-Built an interactive Streamlit interface supporting document upload, conversational querying, and chat history navigation.
+Developed Streamlit UI for seamless document ingestion and conversational experience.
