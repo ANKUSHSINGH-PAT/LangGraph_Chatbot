@@ -6,6 +6,7 @@ from langgraph_rag_backend import (
 )
 from thread_DB import init_db, save_thread, get_threads
 from langchain_core.messages import HumanMessage, AIMessage
+from browser_summary import summarize_url_or_query
 import uuid
 
 # Initialise the SQL Server threads table (no-op if it already exists)
@@ -73,6 +74,31 @@ if uploaded_pdf:
             )
             thread_docs[uploaded_pdf.name] = summary
             status_box.update(label="✅ PDF indexed", state="complete", expanded=False)
+
+st.sidebar.subheader("Web summary")
+st.sidebar.caption("You can also ask the assistant in chat: "
+                   "'summarize https://example.com' or 'summarize AI news'")
+web_query = st.sidebar.text_input("Search URL or topic", placeholder="https://example.com or AI news")
+if st.sidebar.button("Summarize page", use_container_width=True):
+    if web_query:
+        with st.sidebar.status("Gathering page content…", expanded=True) as status_box:
+            try:
+                result = summarize_url_or_query(web_query)
+                st.session_state["web_summary_result"] = result
+                status_box.update(label="✅ Summary ready", state="complete", expanded=False)
+            except Exception as exc:
+                st.session_state["web_summary_result"] = {"error": str(exc)}
+                status_box.update(label="⚠️ Summary failed", state="error", expanded=False)
+    else:
+        st.sidebar.warning("Enter a URL or a search topic first.")
+
+if "web_summary_result" in st.session_state:
+    result = st.session_state["web_summary_result"]
+    if result.get("error"):
+        st.sidebar.error(result["error"])
+    else:
+        st.sidebar.caption(f"Source: {result.get('url')}")
+        st.sidebar.write(result.get("summary", ""))
 
 st.sidebar.subheader("Past conversations")
 past_threads = get_threads()  # [(thread_id, title), ...]

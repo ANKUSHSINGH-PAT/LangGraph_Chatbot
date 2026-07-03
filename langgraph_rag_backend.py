@@ -20,13 +20,14 @@ from langgraph.graph.message import add_messages
 from langchain_openai import ChatOpenAI
 from langgraph.prebuilt import ToolNode, tools_condition
 import requests
+from browser_summary import summarize_url_or_query
 
 load_dotenv()
 
 # -------------------
 # 1. LLM + embeddings
 # -------------------
-OPEN_ROUTER_KEY = os.getenv("OPEN_ROUTER")
+OPEN_ROUTER_KEY = os.getenv("OPEN_ROUTER_KEY")
 llm = ChatOpenAI(
     model="anthropic/claude-3-haiku",
     base_url="https://openrouter.ai/api/v1",
@@ -234,7 +235,19 @@ def rag_tool(query: str, thread_id: Optional[str] = None) -> dict:
     }
 
 
-tools = [search_tool, get_stock_price, calculator, rag_tool]
+@tool
+def web_summary_tool(url_or_query: str) -> dict:
+    """
+    Summarize a webpage or topic from the web.
+    Accepts either a URL or a plain search query.
+    """
+    try:
+        return summarize_url_or_query(url_or_query)
+    except Exception as exc:
+        return {"error": str(exc), "query": url_or_query}
+
+
+tools = [search_tool, get_stock_price, calculator, rag_tool, web_summary_tool]
 llm_with_tools = llm.bind_tools(tools)
 
 # -------------------
@@ -242,6 +255,27 @@ llm_with_tools = llm.bind_tools(tools)
 # -------------------
 class ChatState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
+
+
+# -------------------
+# 4b. Custom ToolNode with config injection
+# -------------------
+class ConfigInjectingToolNode:
+    """Wraps ToolNode to inject thread_id from config into rag_tool calls."""
+
+    def __init__(self, tools):
+        self.tool_node = ToolNode(tools)
+
+    def __call__(self, state: ChatState, config: Optional[dict] = None):
+        # Inject thread_id from config into any rag_tool calls
+        if config and isinstance(config, dict):
+            thread_id = config.get("configurable", {}).get("thread_id")
+            last_msg = state["messages"][-1]
+            if hasattr(last_msg, "tool_calls"):
+                for tc in last_msg.tool_calls:
+                    if tc["name"] == "rag_tool" and thread_id:
+                        tc["args"]["thread_id"] = thread_id
+        return self.tool_node.invoke(state, config)
 
 
 # -------------------
@@ -264,6 +298,7 @@ Rules:
 - If user asks about stock price → ALWAYS call get_stock_price.
 - If user asks math → ALWAYS call calculator.
 - If user asks about uploaded PDF → ALWAYS call rag_tool with thread_id {thread_id}.
+- If user asks to summarize a URL, webpage, or web topic → ALWAYS call web_summary_tool.
 - NEVER answer directly when a tool applies.
 - Prefer tools over your own knowledge.
 
@@ -277,7 +312,7 @@ Thread id: {thread_id}
     return {"messages": [response]}
 
 
-tool_node = ToolNode(tools)
+tool_node = ConfigInjectingToolNode(tools)
 
 # -------------------
 # 6. Checkpointer  (SQL Server)

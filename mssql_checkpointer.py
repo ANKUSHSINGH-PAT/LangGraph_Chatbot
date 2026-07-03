@@ -28,18 +28,25 @@ from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.checkpoint.sqlite.utils import search_where
 from langchain_core.runnables import RunnableConfig
 
+import json
 import random
 
 
 # Connection string — Windows Auth to localhost
+# _CONN_STR = (
+#     "DRIVER={ODBC Driver 17 for SQL Server};"
+#     "SERVER=localhost;"
+#     "DATABASE=chatbot_db;"
+#     "Trusted_Connection=yes;"
+# )
+
 _CONN_STR = (
     "DRIVER={ODBC Driver 17 for SQL Server};"
-    "SERVER=localhost;"
+    "SERVER=LAPTOP-8LIOPLF8;"
     "DATABASE=chatbot_db;"
     "Trusted_Connection=yes;"
+    "TrustServerCertificate=yes;"
 )
-
-
 class MSSQLSaver(BaseCheckpointSaver[str]):
     """LangGraph checkpointer backed by SQL Server (pyodbc, synchronous)."""
 
@@ -162,7 +169,7 @@ class MSSQLSaver(BaseCheckpointSaver[str]):
             return CheckpointTuple(
                 config,
                 self.serde.loads_typed((type_, checkpoint)),
-                cast(CheckpointMetadata, self.jsonplus_serde.loads(metadata) if metadata else {}),
+                cast(CheckpointMetadata, json.loads(metadata) if metadata else {}),
                 (
                     {
                         "configurable": {
@@ -211,7 +218,7 @@ class MSSQLSaver(BaseCheckpointSaver[str]):
             yield CheckpointTuple(
                 {"configurable": {"thread_id": thread_id, "checkpoint_ns": checkpoint_ns, "checkpoint_id": checkpoint_id}},
                 self.serde.loads_typed((type_, checkpoint)),
-                cast(CheckpointMetadata, self.jsonplus_serde.loads(metadata) if metadata else {}),
+                cast(CheckpointMetadata, json.loads(metadata) if metadata else {}),
                 (
                     {"configurable": {"thread_id": thread_id, "checkpoint_ns": checkpoint_ns, "checkpoint_id": parent_checkpoint_id}}
                     if parent_checkpoint_id else None
@@ -232,7 +239,7 @@ class MSSQLSaver(BaseCheckpointSaver[str]):
         thread_id = config["configurable"]["thread_id"]
         checkpoint_ns = config["configurable"]["checkpoint_ns"]
         type_, serialized_checkpoint = self.serde.dumps_typed(checkpoint)
-        serialized_metadata = self.jsonplus_serde.dumps(get_checkpoint_metadata(config, metadata))
+        serialized_metadata = json.dumps(get_checkpoint_metadata(config, metadata)).encode("utf-8")
         with self.cursor() as cur:
             cur.execute(
                 "MERGE dbo.checkpoints AS target "
