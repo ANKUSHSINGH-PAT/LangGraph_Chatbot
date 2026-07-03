@@ -10,3 +10,7 @@ langchain-community
 sentence-transformers
 langchain_openai
 faiss-cpu
+langchain-mcp-adapters
+pdf2image
+pytesseract
+pyodbc

@@ -1,43 +1,31 @@
 import streamlit as st
-from langgraph_backend import chatbot
 from langgraph_rag_backend import (
     chatbot,
     ingest_pdf,
-    retrieve_all_threads,
     thread_document_metadata,
 )
+from thread_DB import init_db, save_thread, get_threads
 from langchain_core.messages import HumanMessage, AIMessage
 import uuid
+
+# Initialise the SQL Server threads table (no-op if it already exists)
+init_db()
 
 # **************************************** utility functions *************************
 
 def generate_thread_id():
-    thread_id = uuid.uuid4()
-    return thread_id
+    return str(uuid.uuid4())
+
 
 def reset_chat():
     thread_id = generate_thread_id()
     st.session_state['thread_id'] = thread_id
-    add_thread(st.session_state['thread_id'])
+    save_thread(thread_id, "New Chat")
     st.session_state['message_history'] = []
 
-if "chat_threads" not in st.session_state:
-    st.session_state["chat_threads"] = []
-
-def add_thread(thread_id,title="New Chat"):
-    for t in st.session_state['chat_threads']:
-        if t["id"] == thread_id:
-            return
-
-    st.session_state['chat_threads'].append({
-        "id": thread_id,
-        "title": title
-    })
-    
 
 def load_conversation(thread_id):
     state = chatbot.get_state(config={'configurable': {'thread_id': thread_id}})
-    # Check if messages key exists in state values, return empty list if not
     return state.values.get('messages', [])
 
 
@@ -47,24 +35,15 @@ if 'message_history' not in st.session_state:
 
 if 'thread_id' not in st.session_state:
     st.session_state['thread_id'] = generate_thread_id()
-
-if "chat_threads" not in st.session_state:
-    st.session_state["chat_threads"] = retrieve_all_threads()
+    save_thread(st.session_state['thread_id'], "New Chat")
 
 if "ingested_docs" not in st.session_state:
     st.session_state["ingested_docs"] = {}
 
-if 'chat_threads' not in st.session_state:
-    st.session_state['chat_threads'] = []
-
-if not st.session_state['chat_threads']:
-    add_thread(st.session_state['thread_id'])
-
 # ============================ Sidebar ============================
 thread_key = str(st.session_state["thread_id"])
 thread_docs = st.session_state["ingested_docs"].setdefault(thread_key, {})
-threads = st.session_state["chat_threads"][::-1]
-selected_thread = None
+
 st.sidebar.title("LangGraph PDF Chatbot")
 st.sidebar.markdown(f"**Thread ID:** `{thread_key}`")
 
@@ -96,46 +75,24 @@ if uploaded_pdf:
             status_box.update(label="✅ PDF indexed", state="complete", expanded=False)
 
 st.sidebar.subheader("Past conversations")
-if not threads:
+past_threads = get_threads()  # [(thread_id, title), ...]
+if not past_threads:
     st.sidebar.write("No past conversations yet.")
 else:
-    for thread_id in threads:
-        if st.sidebar.button(str(thread_id), key=f"side-thread-{thread_id}"):
-            selected_thread = thread_id
-
-
-# **************************************** Sidebar UI *********************************
-
-st.sidebar.title('LangGraph Chatbot')
-
-if st.sidebar.button('New Chat'):
-    reset_chat()
-
-st.sidebar.header('My Conversations')
-
-for chat in st.session_state['chat_threads'][::-1]:
-    if chat["title"] == "New Chat":
-        continue
-
-    if st.sidebar.button(chat['title'],key=chat['id']):
-        st.session_state['thread_id'] = chat['id']
-        messages = load_conversation(chat['id'])
-
-        temp_messages = []
-
-        for msg in messages:
-            if isinstance(msg, HumanMessage):
-                role='user'
-            else:
-                role='assistant'
-            temp_messages.append({'role': role, 'content': msg.content})
-
-        st.session_state['message_history'] = temp_messages
-
+    for tid, title in past_threads:
+        display = title if title and title != "New Chat" else tid[:16] + "…"
+        if st.sidebar.button(display, key=f"side-thread-{tid}"):
+            st.session_state['thread_id'] = tid
+            messages = load_conversation(tid)
+            temp_messages = []
+            for msg in messages:
+                role = 'user' if isinstance(msg, HumanMessage) else 'assistant'
+                temp_messages.append({'role': role, 'content': msg.content})
+            st.session_state['message_history'] = temp_messages
+            st.rerun()
 
 # **************************************** Main UI ************************************
 
-# loading the conversation history
 for message in st.session_state['message_history']:
     with st.chat_message(message['role']):
         st.text(message['content'])
@@ -143,18 +100,16 @@ for message in st.session_state['message_history']:
 user_input = st.chat_input('Type here')
 
 if user_input:
-    for t in st.session_state['chat_threads']:
-        if t["id"] == st.session_state['thread_id'] and t["title"] == "New Chat":
-            t["title"] = user_input[:40]
+    # Update the thread title on first real message
+    if len(st.session_state['message_history']) == 0:
+        save_thread(thread_key, user_input[:60])
 
-    # first add the message to message_history
     st.session_state['message_history'].append({'role': 'user', 'content': user_input})
     with st.chat_message('user'):
         st.text(user_input)
 
     CONFIG = {'configurable': {'thread_id': st.session_state['thread_id']}}
 
-     # first add the message to message_history
     with st.chat_message("assistant"):
         def ai_only_stream():
             for message_chunk, metadata in chatbot.stream(
@@ -163,7 +118,6 @@ if user_input:
                 stream_mode="messages"
             ):
                 if isinstance(message_chunk, AIMessage):
-                    # yield only assistant tokens
                     yield message_chunk.content
 
         ai_message = st.write_stream(ai_only_stream())

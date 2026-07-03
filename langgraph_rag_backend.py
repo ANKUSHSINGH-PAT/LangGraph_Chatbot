@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import sqlite3
 import tempfile
 from typing import Annotated, Any, Dict, Optional, TypedDict
 
@@ -12,9 +11,10 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.tools import DuckDuckGoSearchRun
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_core.documents import Document
 from langchain_core.messages import BaseMessage, SystemMessage
 from langchain_core.tools import tool
-from langgraph.checkpoint.sqlite import SqliteSaver
+from mssql_checkpointer import MSSQLSaver
 from langgraph.graph import START, StateGraph
 from langgraph.graph.message import add_messages
 from langchain_openai import ChatOpenAI
@@ -28,9 +28,9 @@ load_dotenv()
 # -------------------
 OPEN_ROUTER_KEY = os.getenv("OPEN_ROUTER")
 llm = ChatOpenAI(
-    model="meta-llama/llama-3-8b-instruct",
-    base_url="anthropic/claude-3-haiku",
-    api_key=OPEN_ROUTER_KEY
+    model="anthropic/claude-3-haiku",
+    base_url="https://openrouter.ai/api/v1",
+    api_key=OPEN_ROUTER_KEY,
 )
 embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2", model_kwargs={"device": "cpu"})
 
@@ -49,9 +49,61 @@ def _get_retriever(thread_id: Optional[str]):
     return None
 
 
+def _ocr_pdf(pdf_path: str) -> list[Document]:
+    """
+    Fallback: render each PDF page to an image and run Tesseract OCR on it.
+    Requires:  pip install pdf2image pytesseract
+    Also requires Tesseract to be installed on the system:
+      Windows: https://github.com/UB-Mannheim/tesseract/wiki
+      Linux:   sudo apt install tesseract-ocr
+      macOS:   brew install tesseract
+    """
+    try:
+        from pdf2image import convert_from_path  # type: ignore
+        import pytesseract  # type: ignore
+    except ImportError as exc:
+        raise ImportError(
+            "OCR dependencies are not installed. "
+            "Run:  pip install pdf2image pytesseract\n"
+            "Also install Tesseract: https://github.com/UB-Mannheim/tesseract/wiki"
+        ) from exc
+
+    # Point pytesseract at the default Windows install path if not on PATH
+    tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    if os.path.exists(tesseract_cmd):
+        pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+
+    # Resolve poppler's bin directory so pdf2image doesn't need it on PATH.
+    # Check common Windows install locations; fall back to None (use PATH).
+    import glob as _glob
+    _winget_base = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "WinGet", "Packages")
+    # Discover any WinGet-installed poppler version automatically
+    _winget_poppler_bins = _glob.glob(os.path.join(_winget_base, "*oppler*", "poppler-*", "Library", "bin"))
+    _POPPLER_CANDIDATES = _winget_poppler_bins + [
+        r"C:\Program Files\poppler\Library\bin",
+        r"C:\Program Files\poppler\bin",
+        r"C:\poppler\Library\bin",
+        r"C:\poppler\bin",
+    ]
+    poppler_path: Optional[str] = None
+    for _candidate in _POPPLER_CANDIDATES:
+        if os.path.isdir(_candidate):
+            poppler_path = _candidate
+            break
+
+    pages = convert_from_path(pdf_path, dpi=300, poppler_path=poppler_path)
+    docs: list[Document] = []
+    for i, page_img in enumerate(pages):
+        text = pytesseract.image_to_string(page_img)
+        if text.strip():
+            docs.append(Document(page_content=text, metadata={"page": i, "source": pdf_path}))
+    return docs
+
+
 def ingest_pdf(file_bytes: bytes, thread_id: str, filename: Optional[str] = None) -> dict:
     """
     Build a FAISS retriever for the uploaded PDF and store it for the thread.
+    If the PDF has no selectable text (scanned), OCR is attempted automatically.
 
     Returns a summary dict that can be surfaced in the UI.
     """
@@ -70,6 +122,17 @@ def ingest_pdf(file_bytes: bytes, thread_id: str, filename: Optional[str] = None
             chunk_size=1000, chunk_overlap=200, separators=["\n\n", "\n", " ", ""]
         )
         chunks = splitter.split_documents(docs)
+
+        # --- OCR fallback for scanned / image-only PDFs ---
+        if not chunks:
+            docs = _ocr_pdf(temp_path)
+            chunks = splitter.split_documents(docs)
+
+        if not chunks:
+            raise ValueError(
+                "No text could be extracted from the PDF even after OCR. "
+                "The file may be blank or the images unreadable."
+            )
 
         vector_store = FAISS.from_documents(chunks, embeddings)
         retriever = vector_store.as_retriever(
@@ -217,10 +280,9 @@ Thread id: {thread_id}
 tool_node = ToolNode(tools)
 
 # -------------------
-# 6. Checkpointer
+# 6. Checkpointer  (SQL Server)
 # -------------------
-conn = sqlite3.connect(database="chatbot.db", check_same_thread=False)
-checkpointer = SqliteSaver(conn=conn)
+checkpointer = MSSQLSaver.from_conn_string()
 
 # -------------------
 # 7. Graph

@@ -10,12 +10,19 @@ dependencies = [
     "langchain-community>=0.4.1",
     "langchain-core>=1.2.7",
     "langchain-groq>=1.1.1",
+    "langchain-mcp-adapters>=0.2.1",
     "langchain-openai>=1.1.7",
     "langchain-text-splitters>=1.1.0",
     "langgraph>=1.0.7",
-    "langgraph-checkpoint-sqlite>=3.0.3",
+    "langgraph-checkpoint-sqlite>=2.0.11",
     "pypdf>=6.7.0",
     "python-dotenv>=1.2.1",
+    "pyodbc>=5.0.0",
     "sentence-transformers>=5.2.2",
     "streamlit>=1.53.1",
+    "pdf2image>=1.17.0",
+    "pytesseract>=0.3.13",
 ]
+
+[project.scripts]
+chatbot = "streamlit:main"
