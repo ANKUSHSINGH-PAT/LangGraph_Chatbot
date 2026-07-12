@@ -7,6 +7,7 @@ import urllib.request
 from html.parser import HTMLParser
 from typing import Optional
 from urllib.parse import urlparse
+from functools import lru_cache
 
 try:
     from playwright.sync_api import sync_playwright
@@ -17,6 +18,14 @@ try:
     from langchain_openai import ChatOpenAI
 except ImportError:  # pragma: no cover - optional dependency
     ChatOpenAI = None
+
+# Global browser instance for reuse
+_BROWSER_INSTANCE = None
+_BROWSER_CONTEXT = None
+
+# Simple cache for web summaries to avoid re-fetching
+_web_cache: dict[str, dict] = {}
+_CACHE_MAX_SIZE = 50
 
 
 class _HTMLTextExtractor(HTMLParser):
@@ -74,22 +83,82 @@ def _fetch_with_requests(url: str) -> str:
         return extract_text_from_html(html)
 
 
+def _get_browser():
+    """Get or create a persistent browser instance for reuse."""
+    global _BROWSER_INSTANCE, _BROWSER_CONTEXT
+    if sync_playwright is None:
+        return None
+    
+    if _BROWSER_INSTANCE is None or not _BROWSER_INSTANCE.is_connected():
+        try:
+            playwright = sync_playwright().start()
+            _BROWSER_INSTANCE = playwright.chromium.launch(headless=True)
+            _BROWSER_CONTEXT = _BROWSER_INSTANCE.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            )
+        except Exception:
+            return None
+    return _BROWSER_CONTEXT
+
+
+def _close_browser():
+    """Close the persistent browser instance."""
+    global _BROWSER_INSTANCE, _BROWSER_CONTEXT
+    try:
+        if _BROWSER_CONTEXT:
+            _BROWSER_CONTEXT.close()
+        if _BROWSER_INSTANCE:
+            _BROWSER_INSTANCE.close()
+    except Exception:
+        pass
+    finally:
+        _BROWSER_INSTANCE = None
+        _BROWSER_CONTEXT = None
+
+
 def fetch_page_text(url: str) -> str:
     if sync_playwright is None:
         return _fetch_with_requests(url)
 
     try:
-        with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(headless=True)
-            page = browser.new_page()
-            page.goto(url, wait_until="domcontentloaded", timeout=20000)
-            page.wait_for_timeout(1500)
-            content = page.content()
-            browser.close()
-            text = extract_text_from_html(content)
-            return text if text else _fetch_with_requests(url)
+        context = _get_browser()
+        if context:
+            page = context.new_page()
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                page.wait_for_timeout(1000)  # Reduced from 1500ms
+                content = page.content()
+                text = extract_text_from_html(content)
+                page.close()
+                return text if text else _fetch_with_requests(url)
+            except Exception:
+                page.close()
+                return _fetch_with_requests(url)
+        else:
+            return _fetch_with_requests(url)
     except Exception:
         return _fetch_with_requests(url)
+
+
+# Cache LLM instance to avoid recreating it
+_cached_llm = None
+
+
+def _get_llm():
+    """Get or create cached LLM instance."""
+    global _cached_llm
+    if _cached_llm is None and os.getenv("OPEN_ROUTER_KEY") and ChatOpenAI is not None:
+        try:
+            _cached_llm = ChatOpenAI(
+                model="anthropic/claude-3-haiku",
+                base_url="https://openrouter.ai/api/v1",
+                api_key=os.getenv("OPEN_ROUTER_KEY"),
+                temperature=0.7,
+                max_tokens=512,  # Limit for faster responses
+            )
+        except Exception:
+            pass
+    return _cached_llm
 
 
 def summarize_text(text: str, max_sentences: int = 4) -> str:
@@ -100,13 +169,9 @@ def summarize_text(text: str, max_sentences: int = 4) -> str:
     if len(cleaned) > 6000:
         cleaned = cleaned[:6000]
 
-    if os.getenv("OPEN_ROUTER_KEY") and ChatOpenAI is not None:
+    llm = _get_llm()
+    if llm:
         try:
-            llm = ChatOpenAI(
-                model="anthropic/claude-3-haiku",
-                base_url="https://openrouter.ai/api/v1",
-                api_key=os.getenv("OPEN_ROUTER_KEY"),
-            )
             prompt = (
                 "Summarize the following web content in "
                 f"{max_sentences} concise sentences:\n\n{cleaned}"
@@ -133,10 +198,28 @@ def summarize_url_or_query(query: str) -> dict:
     if not _is_url(target):
         target = _build_search_url(target)
 
+    # Check cache first
+    global _web_cache
+    if target in _web_cache:
+        return _web_cache[target]
+
     page_text = fetch_page_text(target)
     summary = summarize_text(page_text)
-    return {
+    result = {
         "url": target,
         "summary": summary,
         "text_length": len(page_text),
     }
+
+    # Cache the result
+    _web_cache[target] = result
+    if len(_web_cache) > _CACHE_MAX_SIZE:
+        # Remove oldest entry
+        _web_cache.pop(next(iter(_web_cache)))
+
+    return result
+
+
+# Register cleanup on exit
+import atexit
+atexit.register(_close_browser)

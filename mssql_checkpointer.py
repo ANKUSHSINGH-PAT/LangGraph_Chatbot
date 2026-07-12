@@ -333,6 +333,21 @@ class MSSQLSaver(BaseCheckpointSaver[str]):
         return f"{next_v:032}.{next_h:016}"
 
     # ------------------------------------------------------------------
+    # delete_thread_data
+    # ------------------------------------------------------------------
+    def delete_thread_data(self, thread_id: str) -> None:
+        """Delete all checkpoints and writes for a given thread_id."""
+        with self.cursor() as cur:
+            cur.execute(
+                "DELETE FROM dbo.writes WHERE thread_id = ?",
+                (str(thread_id),),
+            )
+            cur.execute(
+                "DELETE FROM dbo.checkpoints WHERE thread_id = ?",
+                (str(thread_id),),
+            )
+
+    # ------------------------------------------------------------------
     # async stubs (not supported)
     # ------------------------------------------------------------------
     async def aget_tuple(self, config: RunnableConfig):

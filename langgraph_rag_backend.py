@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import tempfile
 from typing import Annotated, Any, Dict, Optional, TypedDict
@@ -21,19 +22,38 @@ from langchain_openai import ChatOpenAI
 from langgraph.prebuilt import ToolNode, tools_condition
 import requests
 from browser_summary import summarize_url_or_query
+from puppeteer_mcp_client import PUPPETEER_TOOLS, close_puppeteer_client
 
 load_dotenv()
 
 # -------------------
-# 1. LLM + embeddings
+# 1. LLM + embeddings (lazy-loaded for faster startup)
 # -------------------
-OPEN_ROUTER_KEY = os.getenv("OPEN_ROUTER_KEY")
-llm = ChatOpenAI(
-    model="anthropic/claude-3-haiku",
-    base_url="https://openrouter.ai/api/v1",
-    api_key=OPEN_ROUTER_KEY,
-)
-embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2", model_kwargs={"device": "cpu"})
+_llm = None
+_embeddings = None
+
+def get_llm():
+    """Lazy-load LLM only when needed."""
+    global _llm
+    if _llm is None:
+        from langchain_openai import ChatOpenAI
+        OPEN_ROUTER_KEY = os.getenv("OPEN_ROUTER_KEY")
+        _llm = ChatOpenAI(
+            model="anthropic/claude-3-haiku",
+            base_url="https://openrouter.ai/api/v1",
+            api_key=OPEN_ROUTER_KEY,
+            temperature=0.7,
+            max_tokens=1024,  # Limit response length for faster generation
+        )
+    return _llm
+
+def get_embeddings():
+    """Lazy-load embeddings only when needed."""
+    global _embeddings
+    if _embeddings is None:
+        from langchain_community.embeddings import HuggingFaceEmbeddings
+        _embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2", model_kwargs={"device": "cpu"})
+    return _embeddings
 
 
 # -------------------
@@ -135,7 +155,7 @@ def ingest_pdf(file_bytes: bytes, thread_id: str, filename: Optional[str] = None
                 "The file may be blank or the images unreadable."
             )
 
-        vector_store = FAISS.from_documents(chunks, embeddings)
+        vector_store = FAISS.from_documents(chunks, get_embeddings())
         retriever = vector_store.as_retriever(
             search_type="similarity", search_kwargs={"k": 4}
         )
@@ -247,8 +267,11 @@ def web_summary_tool(url_or_query: str) -> dict:
         return {"error": str(exc), "query": url_or_query}
 
 
-tools = [search_tool, get_stock_price, calculator, rag_tool, web_summary_tool]
-llm_with_tools = llm.bind_tools(tools)
+tools = [search_tool, get_stock_price, calculator, rag_tool, web_summary_tool, *PUPPETEER_TOOLS]
+# Lazy binding of tools to LLM
+def get_llm_with_tools():
+    """Get LLM with tools bound (lazy-loaded)."""
+    return get_llm().bind_tools(tools)
 
 # -------------------
 # 4. State
@@ -289,35 +312,28 @@ def chat_node(state: ChatState, config=None):
 
     system_message = SystemMessage(
         content=
-            f"""
-You are a STRICT tool-using assistant.
-
-Rules:
-
-- If user asks about latest news or current events → ALWAYS call DuckDuckGo search tool.
-- If user asks about stock price → ALWAYS call get_stock_price.
-- If user asks math → ALWAYS call calculator.
-- If user asks about uploaded PDF → ALWAYS call rag_tool with thread_id {thread_id}.
-- If user asks to summarize a URL, webpage, or web topic → ALWAYS call web_summary_tool.
-- NEVER answer directly when a tool applies.
-- Prefer tools over your own knowledge.
-
-Thread id: {thread_id}
-"""
-        
+            f"You are a tool-using assistant. Use tools for: news→DuckDuckGo, stocks→get_stock_price, math→calculator, PDF→rag_tool(thread_id={thread_id}), web summary→web_summary_tool, browser→puppeteer_* tools. Prefer tools."
     )
 
     messages = [system_message, *state["messages"]]
-    response = llm_with_tools.invoke(messages, config=config)
+    response = get_llm_with_tools().invoke(messages, config=config)
     return {"messages": [response]}
 
 
 tool_node = ConfigInjectingToolNode(tools)
 
 # -------------------
-# 6. Checkpointer  (SQL Server)
+# 6. Checkpointer  (SQL Server, lazy-loaded)
 # -------------------
-checkpointer = MSSQLSaver.from_conn_string()
+_checkpointer = None
+
+def get_checkpointer():
+    """Lazy-load checkpointer only when needed."""
+    global _checkpointer
+    if _checkpointer is None:
+        from mssql_checkpointer import MSSQLSaver
+        _checkpointer = MSSQLSaver.from_conn_string()
+    return _checkpointer
 
 # -------------------
 # 7. Graph
@@ -330,14 +346,27 @@ graph.add_edge(START, "chat_node")
 graph.add_conditional_edges("chat_node", tools_condition)
 graph.add_edge("tools", "chat_node")
 
-chatbot = graph.compile(checkpointer=checkpointer)
+# Lazy compilation of graph
+_graph_compiled = None
+
+def get_chatbot():
+    """Get compiled chatbot graph (lazy-loaded)."""
+    global _graph_compiled
+    if _graph_compiled is None:
+        _graph_compiled = graph.compile(checkpointer=get_checkpointer())
+    return _graph_compiled
+
+
+# Register shutdown handler to clean up the Puppeteer MCP subprocess
+import atexit
+atexit.register(close_puppeteer_client)
 
 # -------------------
 # 8. Helpers
 # -------------------
 def retrieve_all_threads():
     all_threads = set()
-    for checkpoint in checkpointer.list(None):
+    for checkpoint in get_checkpointer().list(None):
         all_threads.add(checkpoint.config["configurable"]["thread_id"])
     return list(all_threads)
 
@@ -348,3 +377,8 @@ def thread_has_document(thread_id: str) -> bool:
 
 def thread_document_metadata(thread_id: str) -> dict:
     return _THREAD_METADATA.get(str(thread_id), {})
+
+
+def delete_thread_checkpoints(thread_id: str) -> None:
+    """Delete all checkpoints and writes for a thread from the checkpointer."""
+    get_checkpointer().delete_thread_data(thread_id)
